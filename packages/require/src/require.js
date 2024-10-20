@@ -22,70 +22,87 @@ export { resolveUrl } from './resolveUrl'
 // to be nice to bundlers we need indirect eval
 // also self is not available in nodejs
 // when calling runModule, add '\n//# sourceURL='+url to the script to get nice filename and line numbers
-export const runModule = (typeof self === 'undefined' ? eval : self.eval)(
-  '(require, exports, module, source)=>eval(source)',
-)
-const jsExtensions = new Set(['js','ts','cjs','mjs'])
-const lastOf = arr=>arr?.length ? arr[arr.length-1] : '' 
+export const runModule = globalThis.eval('(require, exports, module, source)=>eval(source)')
 
+const jsExtensions = new Set(['js', 'ts', 'cjs', 'mjs'])
+const lastOf = arr => arr?.length ? arr[arr.length - 1] : ''
+
+/**
+ * @typedef SourceWithUrl
+ * @prop {string} url
+ * @prop {string} script
+ */
+
+/**
+ * 
+ * @param {SourceWithUrl | string} urlOrSource 
+ * @param {*} transform 
+ * @param {(path:string,options?:{base:string,output:string})=>string} readFile 
+ * @param {string} base 
+ * @param {string} root 
+ * @param {*} importData 
+ * @param {*} moduleBase 
+ * @returns 
+ */
 export const require = (urlOrSource, transform, readFile, base, root, importData = null, moduleBase = MODULE_BASE) => {
   console.log('require', urlOrSource)
+  /** @type {string | undefined} */
   let source
+  /** @type {string} */
   let url
   let isRelativeFile
   let cache
   let cacheUrl
   let bundleAlias
-  if(typeof urlOrSource === 'string'){
+  if (typeof urlOrSource === 'string') {//Only the URL is given
     url = urlOrSource
-  }else{
+  } else { //URL and source are given (this is the main file)
     source = urlOrSource.script
     url = urlOrSource.url
     isRelativeFile = true
   }
   let exports
   let resolvedUrl = url
-  if(urlOrSource == './colors') debugger
+  if (urlOrSource == './colors') debugger
   if (source === undefined) {
     bundleAlias = requireCache.bundleAlias[url]
-    const aliasedUrl = bundleAlias || requireCache.alias[url] || url
+    const aliasedUrl = bundleAlias ?? requireCache.alias[url] ?? url
 
     const resolved = resolveUrl(aliasedUrl, base, root, moduleBase)
     const resolvedStr = resolved.url.toString()
+    const urlComponents = resolvedStr.split('/')
     // no file ext is usually module from CDN
-    let fileName = lastOf(resolvedStr.split('/'))  
-    let ext = lastOf(fileName.split('.'))  
-    const isJs = ext == fileName || jsExtensions.has(ext)
-    if(!isJs && importData){
+    const isJs = !urlComponents[urlComponents.length - 1].includes('.') || resolvedStr.endsWith('.ts') || resolvedStr.endsWith('.js')
+    if (!isJs && importData) {
       const info = extractPathInfo(resolvedStr)
-      let content = readFile(resolvedStr,{output: importData.isBinaryExt(info.ext)})
+      const content = readFile(resolvedStr, { output: importData.isBinaryExt(info.ext) })
       return importData.deserialize(info, content)
     }
 
     isRelativeFile = resolved.isRelativeFile
     resolvedUrl = resolved.url
     cacheUrl = resolved.url
+    requireCache.knownDependencies.get(base)?.add(cacheUrl)//Mark this module as a dependency of the base module
 
-    cache = requireCache[isRelativeFile ? 'local':'module']
+    cache = requireCache[isRelativeFile ? 'local' : 'module']
     exports = cache[cacheUrl] // get from cache
     if (!exports) {
       // not cached
+
+      //Clear the known dependencies of the old version this module      
+      requireCache.knownDependencies.set(cacheUrl, new Set())
       try {
         const fromCdn = resolvedUrl.includes('jsdelivr.net')
         console.warn('readFile', readFile, resolvedUrl)
         source = readFile(resolvedUrl)
-        
-        if (fromCdn && ext == fileName) {
-          try{
-            let pkg = JSON.parse(readFile(resolvedUrl+'/package.json'))
-            let alias = pkg.unpkg || pkg.main
-            if(alias){
-              const realFile = new URL(alias, resolvedUrl+'/').toString()
-              source = readFile(realFile)
-              resolvedUrl = base = realFile
-            }
-          }catch(e){
-            console.log(e)
+        if (resolvedUrl.includes('jsdelivr.net')) {
+          // jsdelivr will read package.json and tell us what the main file is
+          const srch = ' * Original file: '
+          let idx = source.indexOf(srch)
+          if (idx != -1) {
+            const idx2 = source.indexOf('\n', idx + srch.length + 1)
+            const realFile = new URL(source.substring(idx + srch.length, idx2), resolvedUrl).toString()
+            resolvedUrl = base = realFile
           }
         }
       } catch (e) {
@@ -104,20 +121,20 @@ export const require = (urlOrSource, transform, readFile, base, root, importData
     }
   }
   if (source !== undefined) {
-    let extension = getExtension(resolvedUrl)
+    const extension = getExtension(resolvedUrl)
     // https://cdn.jsdelivr.net/npm/@jscad/svg-serializer@2.3.13/index.js uses require to read package.json
     if (extension === 'json') {
       exports = JSON.parse(source)
     } else {
       // do not transform bundles that are already cjs ( requireCache.bundleAlias.*)
-      if (transform && !bundleAlias){
+      if (transform && !bundleAlias) {
         source = transform(source, resolvedUrl).code
-        if(source.includes('import.meta.url')){
-          source = source.replaceAll('import.meta.url','module.meta.url')
-        } 
+        if (source.includes('import.meta.url')) {
+          source = source.replaceAll('import.meta.url', 'module.meta.url')
+        }
       }
       // construct require function relative to resolvedUrl
-      let requireFunc = newUrl => require(newUrl, transform, readFile, resolvedUrl, root, importData, moduleBase)
+      const requireFunc = newUrl => require(newUrl, transform, readFile, resolvedUrl, root, importData, moduleBase)
       const module = requireModule(url, resolvedUrl, source, requireFunc)
       module.local = isRelativeFile
       exports = module.exports
@@ -125,7 +142,7 @@ export const require = (urlOrSource, transform, readFile, base, root, importData
       // will be effectively transformed to
       // const jscad = require('@jscad/modeling').default
       // we need to plug-in default if missing
-      if(!('default' in exports)) exports.default = exports
+      if (!('default' in exports)) exports.default = exports
     }
   }
 
@@ -137,7 +154,7 @@ export const require = (urlOrSource, transform, readFile, base, root, importData
 const requireModule = (id, url, source, _require) => {
   try {
     const exports = {}
-    const module = { id, uri: url, url, exports, source, meta:{url, uri:url} } // according to node.js modules
+    const module = { id, uri: url, url, exports, source, meta: { url, uri: url } } // according to node.js modules
     //module.require = _require
     source += '\n//# sourceURL=' + url
     runModule(_require, exports, module, source)
@@ -149,13 +166,37 @@ const requireModule = (id, url, source, _require) => {
 }
 
 /**
- * Clear file cache for specific files. Used when a file has changed.
+ * @typedef ClearFileCacheOptions
+ * @prop {Array<String>} files
+ * @prop {string} root
  */
-export const clearFileCache = async ({files}) => {
+
+/**
+ * Clear file cache for specific files. Used when a file has changed.
+ * @param {ClearFileCacheOptions} obj
+ */
+export const clearFileCache = ({ files, root }) => {
   const cache = requireCache.local
-  files.forEach(f=>{
-    delete cache[f]
-  })
+
+  /**
+   * @param {string} url 
+   */
+  const clearDependencies = (url) => {
+    delete cache[url]
+    const dependents = [...requireCache.knownDependencies.entries()].filter(([_, value]) => value.has(url))
+    for (const [dependency, _] of dependents) {
+      clearDependencies(dependency)
+    }
+  }
+
+  for (const file of files) {
+    delete cache[file]
+    if (root !== undefined) {
+      const path = file.startsWith("/") ? `.${file}` : file
+      const url = new URL(path, root)
+      clearDependencies(url.toString())
+    }
+  }
 }
 
 /**
@@ -166,9 +207,20 @@ export const jscadClearTempCache = () => {
   requireCache.alias = {}
 }
 
+
+/**
+ * @type {{
+ * local:Object.<string,Object>
+ * alias:Object.<string,string>
+ * module:Object.<string,Object>
+ * bundleAlias:Object.<string,string>
+ * knownDependencies:Map.<string,Set<string>>
+ * }}
+ */
 export const requireCache = {
   local: {},
   alias: {},
   module: {},
   bundleAlias: {},
+  knownDependencies: new Map(),
 }
